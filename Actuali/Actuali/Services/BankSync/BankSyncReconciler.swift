@@ -88,6 +88,19 @@ enum BankSyncReconciler {
         var plan = BankSyncPlan()
         let normalizedCandidates = normalize(candidates, rejectedConflicts: &plan.rejectedConflicts)
         let sortedExisting = existing.sorted { $0.id < $1.id }
+        var liveByImportedId: [String: [BankSyncExistingTransaction]] = [:]
+        var deletedByImportedId: [String: BankSyncExistingTransaction] = [:]
+        for row in sortedExisting {
+            guard let importedId = row.importedId else { continue }
+            if row.tombstone {
+                if !reimportDeleted, deletedByImportedId[importedId] == nil {
+                    deletedByImportedId[importedId] = row
+                }
+            } else {
+                liveByImportedId[importedId, default: []].append(row)
+            }
+        }
+        var liveCursorByImportedId: [String: Int] = [:]
 
         // Pass 1: the provider's transaction id. Anything that misses gets a
         // window of same-amount transactions to try the later passes against,
@@ -101,16 +114,21 @@ enum BankSyncReconciler {
         // duplicate it.
         var pending: [(candidate: BankSyncCandidate, match: BankSyncExistingTransaction?, window: [FuzzyMatch])] = []
         for candidate in normalizedCandidates {
-            let liveMatch = sortedExisting.first(where: {
-                $0.importedId == candidate.importedId
-                    && !$0.tombstone
-                    && !matchedIds.contains($0.id)
-            })
-            let deletedMatch = reimportDeleted ? nil : sortedExisting.first(where: {
-                $0.importedId == candidate.importedId
-                    && $0.tombstone
-            })
-            if let match = liveMatch ?? deletedMatch {
+            var liveMatch: BankSyncExistingTransaction?
+            if let liveRows = liveByImportedId[candidate.importedId] {
+                var cursor = liveCursorByImportedId[candidate.importedId, default: 0]
+                while cursor < liveRows.count, matchedIds.contains(liveRows[cursor].id) {
+                    cursor += 1
+                }
+                if cursor < liveRows.count {
+                    liveMatch = liveRows[cursor]
+                    cursor += 1
+                }
+                liveCursorByImportedId[candidate.importedId] = cursor
+            }
+            // Live buckets retain the ID sort; a tombstone stays reusable for
+            // every repeated download once no unmatched live row remains.
+            if let match = liveMatch ?? deletedByImportedId[candidate.importedId] {
                 matchedIds.insert(match.id)
                 pending.append((candidate, match, []))
                 continue
